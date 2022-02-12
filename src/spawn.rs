@@ -149,3 +149,37 @@ pub async fn commit<'b, E: sqlx::Executor<'b, Database = Postgres>>(
         .await?;
     Ok(())
 }
+
+/// Clear jobs from the specified queues.
+pub async fn clear<'b, E: sqlx::Executor<'b, Database = Postgres>>(
+    executor: E,
+    channel_names: &[&str],
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT mq_clear($1)")
+        .bind(channel_names)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+/// Clear jobs from the specified queues.
+pub async fn clear_all<'b, E: sqlx::Executor<'b, Database = Postgres>>(
+    executor: E,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT mq_clear_all()")
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+/// Check if a job with that ID exists
+pub async fn exists<'b, E: sqlx::Executor<'b, Database = Postgres>>(
+    executor: E,
+    id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let exists = sqlx::query_scalar("SELECT EXISTS(SELECT id FROM mq_msgs WHERE id = $1)")
+        .bind(id)
+        .fetch_one(executor)
+        .await?;
+    Ok(exists)
+}

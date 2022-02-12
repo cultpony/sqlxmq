@@ -234,6 +234,31 @@ pub use spawn::*;
 pub use sqlxmq_macros::job;
 pub use utils::OwnedHandle;
 
+/// Helper function to determine if a particular error condition is retryable.
+///
+/// For best results, database operations should be automatically retried if one
+/// of these errors is returned.
+pub fn should_retry(error: &sqlx::Error) -> bool {
+    if let Some(db_error) = error.as_database_error() {
+        // It's more readable as a match
+        #[allow(clippy::match_like_matches_macro)]
+        match (db_error.code().as_deref(), db_error.constraint()) {
+            // Foreign key constraint violation on ordered channel
+            (Some("23503"), Some("mq_msgs_after_message_id_fkey")) => true,
+            // Unique constraint violation on ordered channel
+            (Some("23505"), Some("mq_msgs_channel_name_channel_args_after_message_id_idx")) => true,
+            // Serialization failure
+            (Some("40001"), _) => true,
+            // Deadlock detected
+            (Some("40P01"), _) => true,
+            // Other
+            _ => false,
+        }
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,7 +296,7 @@ mod tests {
 
         let _ = dotenv::dotenv();
 
-        INIT_LOGGER.call_once(|| pretty_env_logger::init());
+        INIT_LOGGER.call_once(pretty_env_logger::init);
 
         let pool = Pool::connect(&env::var("DATABASE_URL").unwrap())
             .await
@@ -359,7 +384,7 @@ mod tests {
         {
             let pool = &*test_pool().await;
             let (_runner, counter) =
-                test_job_runner(&pool, |mut job| async move { job.complete().await }).await;
+                test_job_runner(pool, |mut job| async move { job.complete().await }).await;
 
             assert_eq!(counter.load(Ordering::SeqCst), 0);
             JobBuilder::new("foo").spawn(pool).await.unwrap();
@@ -370,12 +395,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn it_can_clear_jobs() {
+        {
+            let pool = &*test_pool().await;
+            JobBuilder::new("foo")
+                .set_channel_name("foo")
+                .spawn(pool)
+                .await
+                .unwrap();
+            JobBuilder::new("foo")
+                .set_channel_name("foo")
+                .spawn(pool)
+                .await
+                .unwrap();
+            JobBuilder::new("foo")
+                .set_channel_name("bar")
+                .spawn(pool)
+                .await
+                .unwrap();
+            JobBuilder::new("foo")
+                .set_channel_name("bar")
+                .spawn(pool)
+                .await
+                .unwrap();
+            JobBuilder::new("foo")
+                .set_channel_name("baz")
+                .spawn(pool)
+                .await
+                .unwrap();
+            JobBuilder::new("foo")
+                .set_channel_name("baz")
+                .spawn(pool)
+                .await
+                .unwrap();
+
+            sqlxmq::clear(pool, &["foo", "baz"]).await.unwrap();
+
+            let (_runner, counter) =
+                test_job_runner(pool, |mut job| async move { job.complete().await }).await;
+
+            pause().await;
+            assert_eq!(counter.load(Ordering::SeqCst), 2);
+        }
+        pause().await;
+    }
+
+    #[tokio::test]
     async fn it_runs_jobs_in_order() {
         {
             let pool = &*test_pool().await;
             let (tx, mut rx) = mpsc::unbounded();
 
-            let (_runner, counter) = test_job_runner(&pool, move |job| {
+            let (_runner, counter) = test_job_runner(pool, move |job| {
                 let tx = tx.clone();
                 async move {
                     tx.unbounded_send(job).unwrap();
@@ -413,7 +484,7 @@ mod tests {
             let pool = &*test_pool().await;
             let (tx, mut rx) = mpsc::unbounded();
 
-            let (_runner, counter) = test_job_runner(&pool, move |job| {
+            let (_runner, counter) = test_job_runner(pool, move |job| {
                 let tx = tx.clone();
                 async move {
                     tx.unbounded_send(job).unwrap();
@@ -440,7 +511,7 @@ mod tests {
     async fn it_retries_failed_jobs() {
         {
             let pool = &*test_pool().await;
-            let (_runner, counter) = test_job_runner(&pool, move |_| async {}).await;
+            let (_runner, counter) = test_job_runner(pool, move |_| async {}).await;
 
             let backoff = 500;
 
@@ -477,7 +548,7 @@ mod tests {
     async fn it_can_checkpoint_jobs() {
         {
             let pool = &*test_pool().await;
-            let (_runner, counter) = test_job_runner(&pool, move |mut current_job| async move {
+            let (_runner, counter) = test_job_runner(pool, move |mut current_job| async move {
                 let state: bool = current_job.json().unwrap().unwrap();
                 if state {
                     current_job.complete().await.unwrap();
